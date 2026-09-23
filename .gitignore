@@ -1,0 +1,7 @@
+/.build-cache/
+/.build-tools/
+/dist/
+/release-*/
+/src/android/.gradle/
+/src/android/app/build/
+.DS_Store

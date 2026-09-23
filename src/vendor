@@ -1,0 +1,99 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PUBLIC_DIR="${1:?usage: vendor PUBLIC_DIR CACHE_DIR}"
+VENDOR_CACHE="${2:?usage: vendor PUBLIC_DIR CACHE_DIR}"
+VENDOR_PUBLIC="$PUBLIC_DIR/offline/vendor"
+
+mkdir -p "$VENDOR_CACHE" "$VENDOR_PUBLIC"
+
+fetch_vendor() {
+    local url="$1"
+    local dst="$2"
+    shift 2
+
+    mkdir -p "$(dirname "$VENDOR_CACHE/$dst")"
+    mkdir -p "$(dirname "$VENDOR_PUBLIC/$dst")"
+
+    if [ ! -f "$VENDOR_CACHE/$dst" ]; then
+        echo "Downloading $url"
+        curl -fL "$@" "$url" -o "$VENDOR_CACHE/$dst"
+    fi
+
+    cp "$VENDOR_CACHE/$dst" "$VENDOR_PUBLIC/$dst"
+}
+
+fetch_vendor \
+    'https://code.jquery.com/jquery-3.7.1.min.js' \
+    'jquery/jquery-3.7.1.min.js'
+
+fetch_vendor \
+    'https://cdn.jsdelivr.net/npm/mermaid@9.3.0/dist/mermaid.min.js' \
+    'mermaid/mermaid-9.3.0.min.js'
+
+fetch_vendor \
+    'https://cdnjs.cloudflare.com/ajax/libs/iframe-resizer/4.3.9/iframeResizer.min.js' \
+    'iframe-resizer/iframeResizer-4.3.9.min.js'
+
+KATEX_BASE='https://cdn.jsdelivr.net/npm/katex@0.16.10/dist'
+
+fetch_vendor "$KATEX_BASE/katex.min.js" \
+    'katex-0.16.10/katex.min.js'
+
+fetch_vendor "$KATEX_BASE/contrib/auto-render.min.js" \
+    'katex-0.16.10/contrib/auto-render.min.js'
+
+fetch_vendor "$KATEX_BASE/katex.min.css" \
+    'katex-0.16.10/katex.min.css'
+
+KATEX_CSS="$VENDOR_CACHE/katex-0.16.10/katex.min.css"
+
+while IFS= read -r font; do
+    fetch_vendor \
+        "$KATEX_BASE/$font" \
+        "katex-0.16.10/$font"
+done < <(
+    python3 - "$KATEX_CSS" <<'PY'
+import re
+import sys
+
+css = open(sys.argv[1], encoding="utf-8").read()
+for url in sorted(set(re.findall(r'url\(([^)]+)\)', css))):
+    url = url.strip("\"'")
+    if url.startswith("fonts/"):
+        print(url)
+PY
+)
+
+GOOGLE_FONT_URL='https://fonts.googleapis.com/css?family=Open+Sans:300,300i,400,400i,700,700i&display=swap'
+fetch_vendor "$GOOGLE_FONT_URL" \
+    'google-fonts/open-sans.css' \
+    -A 'Mozilla/5.0'
+
+FONT_CSS_CACHE="$VENDOR_CACHE/google-fonts/open-sans.css"
+FONT_CSS_PUBLIC="$VENDOR_PUBLIC/google-fonts/open-sans.css"
+
+while IFS= read -r url; do
+    fetch_vendor \
+        "$url" \
+        "google-fonts/fonts/$(basename "$url")"
+done < <(
+    grep -oE 'https://fonts\.gstatic\.com/[^)]+' "$FONT_CSS_CACHE" | sort -u
+)
+
+python3 - "$FONT_CSS_CACHE" "$FONT_CSS_PUBLIC" <<'PY'
+from pathlib import Path
+from urllib.parse import urlparse
+import re
+import sys
+
+src = Path(sys.argv[1])
+dst = Path(sys.argv[2])
+css = src.read_text(encoding="utf-8")
+css = re.sub(
+    r'https://fonts\.gstatic\.com/[^)]+',
+    lambda m: 'fonts/' + Path(urlparse(m.group(0)).path).name,
+    css,
+)
+dst.write_text(css, encoding="utf-8")
+PY

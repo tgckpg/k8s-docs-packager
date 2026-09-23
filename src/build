@@ -1,0 +1,284 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+RELEASE="${RELEASE:?RELEASE is required, e.g. RELEASE=1.37 make install}"
+WEBSITE_ROOT="$PROJECT_ROOT/release-$RELEASE"
+ANDROID_DIR="$PROJECT_ROOT/src/android"
+CACHE_ROOT="$PROJECT_ROOT/.build-cache/release-$RELEASE"
+PUBLIC_DIR="$CACHE_ROOT/public"
+ASSETS_DIR="$CACHE_ROOT/android-assets"
+OUT_DIR="$PROJECT_ROOT/dist"
+
+EXPECTED_BRANCH="release-$RELEASE"
+DOCS_VERSION="$RELEASE"
+BASE_URL="${K8S_DOCS_BASE_URL:-https://k8s.local/}"
+HUGO_SEGMENT="${K8S_DOCS_SEGMENT:-en}"
+CONTAINER_ENGINE="${CONTAINER_ENGINE:-docker}"
+GRADLE_VERSION="${GRADLE_VERSION:-8.9}"
+IMAGE_REGISTRY="${IMAGE_REGISTRY:-gcr.io/k8s-staging-sig-docs}"
+
+
+die() {
+    echo "error: $*" >&2
+    exit 1
+}
+
+need() {
+    command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"
+}
+
+sha256_stream() {
+    if command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 | awk '{print $1}'
+    elif command -v sha256sum >/dev/null 2>&1; then
+        sha256sum | awk '{print $1}'
+    else
+        die "missing shasum or sha256sum"
+    fi
+}
+
+hash_files0() {
+    if command -v shasum >/dev/null 2>&1; then
+        xargs -0 shasum -a 256
+    elif command -v sha256sum >/dev/null 2>&1; then
+        xargs -0 sha256sum
+    else
+        die "missing shasum or sha256sum"
+    fi
+}
+
+setup_java() {
+    if [ -n "${JAVA_HOME:-}" ] && [ -x "$JAVA_HOME/bin/java" ]; then
+        export PATH="$JAVA_HOME/bin:$PATH"
+        return
+    fi
+
+    if [ "$(uname -s)" = "Darwin" ]; then
+        if /usr/libexec/java_home -v 21 >/dev/null 2>&1; then
+            export JAVA_HOME="$(/usr/libexec/java_home -v 21)"
+            export PATH="$JAVA_HOME/bin:$PATH"
+            return
+        fi
+
+        if command -v brew >/dev/null 2>&1; then
+            local prefix
+            prefix="$(brew --prefix openjdk@21 2>/dev/null || true)"
+            if [ -n "$prefix" ]; then
+                if [ -d "$prefix/libexec/openjdk.jdk/Contents/Home" ]; then
+                    export JAVA_HOME="$prefix/libexec/openjdk.jdk/Contents/Home"
+                else
+                    export JAVA_HOME="$prefix"
+                fi
+                export PATH="$JAVA_HOME/bin:$PATH"
+                return
+            fi
+        fi
+    fi
+}
+
+setup_android_sdk() {
+    if [ -n "${ANDROID_HOME:-}" ]; then
+        :
+    elif [ -n "${ANDROID_SDK_ROOT:-}" ]; then
+        export ANDROID_HOME="$ANDROID_SDK_ROOT"
+    elif [ -d "$HOME/.rbash/lib/Android" ]; then
+        export ANDROID_HOME="$HOME/.rbash/lib/Android"
+    elif [ -d "$HOME/Library/Android/sdk" ]; then
+        export ANDROID_HOME="$HOME/Library/Android/sdk"
+    fi
+
+    [ -n "${ANDROID_HOME:-}" ] || die "ANDROID_HOME is not set and no Android SDK was found"
+    export ANDROID_SDK_ROOT="$ANDROID_HOME"
+    export PATH="$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$ANDROID_HOME/cmdline-tools/latest/bin:$PATH"
+}
+
+setup_java
+setup_android_sdk
+
+need git
+need make
+need java
+need curl
+need unzip
+need python3
+need pagefind
+need "$CONTAINER_ENGINE"
+
+[ -f "$WEBSITE_ROOT/hugo.toml" ] || die "$WEBSITE_ROOT is not a kubernetes/website checkout"
+[ -x "$WEBSITE_ROOT/scripts/hash-files.sh" ] || die "$WEBSITE_ROOT/scripts/hash-files.sh is missing"
+[ -d "$ANDROID_DIR/app" ] || die "$ANDROID_DIR is missing"
+
+branch="$(git -C "$WEBSITE_ROOT" branch --show-current)"
+[ "$branch" = "$EXPECTED_BRANCH" ] || die "$WEBSITE_ROOT is on '$branch', expected '$EXPECTED_BRANCH'"
+
+mkdir -p "$CACHE_ROOT" "$OUT_DIR"
+
+echo "== Kubernetes offline docs =="
+echo "release: $RELEASE"
+echo "repo:    $WEBSITE_ROOT"
+echo "cache:   $CACHE_ROOT"
+echo "segment: $HUGO_SEGMENT"
+echo
+java -version
+
+echo
+echo "== Initializing git submodules =="
+make -C "$WEBSITE_ROOT" module-init
+
+HUGO_VERSION="$(
+    grep '^HUGO_VERSION' "$WEBSITE_ROOT/netlify.toml" \
+        | tail -n 1 \
+        | cut -d '=' -f 2 \
+        | tr -d ' \"\n'
+)"
+
+IMAGE_VERSION="$(
+    cd "$WEBSITE_ROOT"
+    scripts/hash-files.sh \
+        Dockerfile \
+        Makefile \
+        netlify.toml \
+        .dockerignore \
+        cloudbuild.yaml \
+        package.json \
+        package-lock.json \
+        | cut -c 1-12
+)"
+
+CONTAINER_IMAGE="${CONTAINER_IMAGE:-$IMAGE_REGISTRY/k8s-website-hugo:v${HUGO_VERSION}-${IMAGE_VERSION}}"
+
+echo
+echo "== Pulling upstream Kubernetes Hugo image =="
+echo "image: $CONTAINER_IMAGE"
+"$CONTAINER_ENGINE" pull "$CONTAINER_IMAGE"
+
+HUGO_CACHE_KEY_FILE="$CACHE_ROOT/hugo.key"
+HUGO_CACHE_KEY="$(
+    cd "$WEBSITE_ROOT"
+    {
+        printf '%s\n' \
+            "release=$RELEASE" \
+            "baseURL=$BASE_URL" \
+            "segment=$HUGO_SEGMENT" \
+            "image=$CONTAINER_IMAGE"
+
+        find archetypes assets content data i18n layouts static \
+            -type f -print0 \
+        | sort -z \
+        | hash_files0
+    } \
+    | sha256_stream
+)"
+
+CACHED_HUGO_KEY="$(cat "$HUGO_CACHE_KEY_FILE" 2>/dev/null || true)"
+
+if [ "$HUGO_CACHE_KEY" = "$CACHED_HUGO_KEY" ] && [ -f "$PUBLIC_DIR/index.html" ]; then
+    echo
+echo "== Reusing cached Hugo site =="
+else
+    echo
+echo "== Building Hugo site in container =="
+
+    rm -rf "$PUBLIC_DIR"
+    mkdir -p "$PUBLIC_DIR"
+
+    "$CONTAINER_ENGINE" run --rm \
+        --read-only \
+        --mount "type=bind,source=$WEBSITE_ROOT/.git,target=/src/.git,readonly" \
+        --mount "type=bind,source=$WEBSITE_ROOT/archetypes,target=/src/archetypes,readonly" \
+        --mount "type=bind,source=$WEBSITE_ROOT/assets,target=/src/assets,readonly" \
+        --mount "type=bind,source=$WEBSITE_ROOT/content,target=/src/content,readonly" \
+        --mount "type=bind,source=$WEBSITE_ROOT/data,target=/src/data,readonly" \
+        --mount "type=bind,source=$WEBSITE_ROOT/i18n,target=/src/i18n,readonly" \
+        --mount "type=bind,source=$WEBSITE_ROOT/layouts,target=/src/layouts,readonly" \
+        --mount "type=bind,source=$WEBSITE_ROOT/static,target=/src/static,readonly" \
+        --mount "type=bind,source=$WEBSITE_ROOT/hugo.toml,target=/src/hugo.toml,readonly" \
+        --mount "type=bind,source=$WEBSITE_ROOT/hugo.server.toml,target=/src/hugo.server.toml,readonly" \
+        --mount "type=bind,source=$PUBLIC_DIR,target=/tmp/public" \
+        --mount "type=tmpfs,destination=/tmp,tmpfs-mode=01777" \
+        "$CONTAINER_IMAGE" \
+        hugo \
+            --destination /tmp/public \
+            --cleanDestinationDir \
+            --minify \
+            --environment production \
+            --noBuildLock \
+            --baseURL "$BASE_URL" \
+            --renderSegments "$HUGO_SEGMENT"
+
+    [ -f "$PUBLIC_DIR/index.html" ] || die "Hugo did not produce index.html"
+    printf '%s\n' "$HUGO_CACHE_KEY" > "$HUGO_CACHE_KEY_FILE"
+fi
+
+PAGEFIND_VERSION="$(pagefind --version 2>&1 | head -n 1)"
+PAGEFIND_KEY="$(printf '%s\n%s\n' "$HUGO_CACHE_KEY" "$PAGEFIND_VERSION" | sha256_stream)"
+PAGEFIND_KEY_FILE="$CACHE_ROOT/pagefind.key"
+CACHED_PAGEFIND_KEY="$(cat "$PAGEFIND_KEY_FILE" 2>/dev/null || true)"
+
+if [ "$PAGEFIND_KEY" = "$CACHED_PAGEFIND_KEY" ] && [ -f "$PUBLIC_DIR/pagefind/pagefind-ui.js" ]; then
+    echo
+echo "== Reusing cached Pagefind index =="
+else
+    echo
+echo "== Building Pagefind index =="
+    rm -rf "$PUBLIC_DIR/pagefind"
+    pagefind --site "$PUBLIC_DIR"
+    [ -f "$PUBLIC_DIR/pagefind/pagefind-ui.js" ] || die "Pagefind did not produce pagefind-ui.js"
+    printf '%s\n' "$PAGEFIND_KEY" > "$PAGEFIND_KEY_FILE"
+fi
+
+echo
+echo "== Vendoring offline runtime assets =="
+"$PROJECT_ROOT/src/vendor" "$PUBLIC_DIR" "$PROJECT_ROOT/.build-cache/vendor"
+
+echo
+echo "== Packing site into Android assets =="
+rm -rf "$ASSETS_DIR"
+mkdir -p "$ASSETS_DIR/site"
+cp -R "$PUBLIC_DIR/." "$ASSETS_DIR/site/"
+
+cat > "$ASSETS_DIR/build-info.json" <<JSON
+{
+  "docsVersion": "$DOCS_VERSION",
+  "gitBranch": "$(git -C "$WEBSITE_ROOT" branch --show-current)",
+  "gitCommit": "$(git -C "$WEBSITE_ROOT" rev-parse HEAD)",
+  "baseUrl": "$BASE_URL",
+  "segment": "$HUGO_SEGMENT",
+  "hugoImage": "$CONTAINER_IMAGE"
+}
+JSON
+
+mkdir -p "$PROJECT_ROOT/.build-tools"
+GRADLE_HOME="$PROJECT_ROOT/.build-tools/gradle-$GRADLE_VERSION"
+
+if [ ! -x "$GRADLE_HOME/bin/gradle" ]; then
+    echo
+echo "== Fetching Gradle $GRADLE_VERSION =="
+    ZIP="$PROJECT_ROOT/.build-tools/gradle-$GRADLE_VERSION-bin.zip"
+    curl -fL \
+        "https://services.gradle.org/distributions/gradle-$GRADLE_VERSION-bin.zip" \
+        -o "$ZIP"
+    rm -rf "$GRADLE_HOME"
+    unzip -q "$ZIP" -d "$PROJECT_ROOT/.build-tools"
+    rm -f "$ZIP"
+fi
+
+echo
+echo "== Building Android APK =="
+"$GRADLE_HOME/bin/gradle" \
+    -p "$ANDROID_DIR" \
+    --no-daemon \
+    -Pk8sDocsVersion="$DOCS_VERSION" \
+    -Pk8sDocsAssetsDir="$ASSETS_DIR" \
+    :app:assembleDebug
+
+APK="$ANDROID_DIR/app/build/outputs/apk/debug/app-debug.apk"
+[ -f "$APK" ] || die "Gradle completed but APK is missing: $APK"
+
+OUT="$OUT_DIR/k8s-docs-v${DOCS_VERSION}.apk"
+cp "$APK" "$OUT"
+
+echo
+echo "Built:"
+echo "  $OUT"

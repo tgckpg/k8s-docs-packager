@@ -1,0 +1,44 @@
+plugins {
+    id 'com.android.application'
+}
+
+def docsVersion = providers.gradleProperty('k8sDocsVersion').getOrElse('0.0')
+def versionParts = docsVersion.tokenize('.')
+def docsVersionCode = versionParts.size() >= 2 \
+    ? versionParts[0].toInteger() * 10000 + versionParts[1].toInteger() * 100 \
+    : 1
+
+def docsAssetsDir = providers.gradleProperty('k8sDocsAssetsDir').orNull
+
+android {
+    namespace 'net.astropenguin.k8sdocs'
+    compileSdk 35
+
+    defaultConfig {
+        applicationId "net.astropenguin.k8sdocs"
+        minSdk 26
+        targetSdk 35
+        versionCode docsVersionCode
+        versionName docsVersion
+    }
+
+    if (docsAssetsDir != null) {
+        sourceSets {
+            main {
+                assets.srcDirs = [file(docsAssetsDir)]
+            }
+        }
+    }
+
+    packaging {
+        resources {
+            excludes += [
+                "META-INF/DEPENDENCIES",
+                "META-INF/LICENSE",
+                "META-INF/LICENSE.txt",
+                "META-INF/NOTICE",
+                "META-INF/NOTICE.txt"
+            ]
+        }
+    }
+}
